@@ -1,0 +1,21 @@
+{
+  "name": "qz-service",
+  "version": "1.0.0",
+  "description": "CLI for registering services with QueryZero and obtaining BBS+ credentials with ZK selective disclosure",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "qz-service": "./src/cli.ts"
+  },
+  "scripts": {
+    "start": "bun src/cli.ts",
+    "build": "bun build src/cli.ts --compile --outfile dist/qz-service"
+  },
+  "dependencies": {
+    "@digitalbazaar/bbs-signatures": "3.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.7.0"
+  }
+}

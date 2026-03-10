@@ -1,0 +1,15 @@
+{
+  "name": "qz-toolkit",
+  "version": "1.0.0",
+  "private": true,
+  "description": "QueryZero CLI toolkit — service and agent credential management with BBS+ selective disclosure",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "cd packages/qz-service && bun run build && cd ../qz-agent && bun run build",
+    "build:service": "cd packages/qz-service && bun run build",
+    "build:agent": "cd packages/qz-agent && bun run build"
+  },
+  "license": "MIT"
+}

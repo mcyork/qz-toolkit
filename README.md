@@ -1,0 +1,68 @@
+# qz-toolkit
+
+CLI tools for [QueryZero](https://queryzero.net) — BBS+ credential management with zero-knowledge selective disclosure.
+
+## Tools
+
+### qz-service
+
+Register your service domain via DNS challenge and receive a BBS+ credential. Derive ZK proofs revealing only the claims you choose.
+
+```bash
+qz-service register api.example.com --category data-api
+qz-service verify api.example.com
+qz-service proof api.example.com --indexes 1,7,11
+```
+
+### qz-agent
+
+Register your agent via wallet signing and receive a BBS+ credential. Supports optional attestations (Moltbook, Farcaster).
+
+```bash
+qz-agent register my-agent --operator example.com --key 0x...
+qz-agent proof my-agent --indexes 0,1,7
+qz-agent attest farcaster my-agent
+```
+
+## Install
+
+Requires [Bun](https://bun.sh) v1.0+.
+
+```bash
+git clone https://github.com/mcyork/qz-toolkit.git
+cd qz-toolkit
+bun install
+```
+
+### Run directly
+
+```bash
+bun packages/qz-service/src/cli.ts --help
+bun packages/qz-agent/src/cli.ts --help
+```
+
+### Compile to binaries
+
+```bash
+bun run build
+# Produces:
+#   packages/qz-service/dist/qz-service
+#   packages/qz-agent/dist/qz-agent
+```
+
+## Testnet
+
+Both tools default to `https://queryzero.net`. For testnet:
+
+```bash
+qz-service register example.com --url http://testnet.queryzero.net
+qz-agent register my-agent --operator example.com --key 0x... --url http://testnet.queryzero.net
+```
+
+## Examples
+
+See the [examples/](examples/) directory for working integration samples.
+
+## License
+
+MIT
