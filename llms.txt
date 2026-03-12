@@ -1,0 +1,303 @@
+# QueryZero Toolkit
+
+> BBS+ verifiable credentials with zero-knowledge selective disclosure for services and AI agents.
+
+QueryZero lets you prove facts about yourself (domain ownership, KYC status, wallet address) without revealing everything. You choose which claims to disclose. Your holder secret never leaves your machine.
+
+This file explains how to integrate QueryZero credentials into your own code — not just use the CLI tools.
+
+## Architecture
+
+1. **Registration**: You generate a holder secret locally, send a cryptographic commitment (not the secret) to the QueryZero server, complete a challenge (DNS for services, wallet signature for agents), and receive a BBS+ blind-signed credential.
+
+2. **Credential file** (`~/.qz/credentials/{agents,services}/<name>.json`): Contains the blind signature, 16 claims as plaintext strings, your holder secret, and the secret prover blind. This file is the credential. It cannot be re-downloaded. Treat it like a private key.
+
+3. **Proof generation**: Using BlindProofGen, you select which claim indexes to reveal. The output is a ZK proof that anyone can verify using only the proof + issuer public key. No network call needed.
+
+4. **Proof serving**: Encode the proof bundle as base64 JSON and serve it in an `X-Service-Credential` HTTP header (or any transport).
+
+## Credential File Format
+
+```json
+{
+  "type": "QueryZeroServiceIdentity",
+  "schema": "https://queryzero.net/api/v1/schemas/service-identity-v1",
+  "credentialId": "uuid",
+  "header": "<base64>",
+  "signature": "<base64>",
+  "publicKey": "<base64 issuer public key>",
+  "messages": [
+    "subjectDid=did:web:example.com",
+    "serviceDomain=example.com",
+    "category=data-api",
+    ...
+  ],
+  "messageCount": 16,
+  "ciphersuite": "BLS12-381-SHA-256",
+  "blind": true,
+  "secretProverBlind": "<hex string — YOUR SECRET>",
+  "holderSecret": "<base64 — YOUR SECRET>"
+}
+```
+
+The `messages` array is indexed. Each message is a `key=value` string. The `secretProverBlind` and `holderSecret` fields are your private material — they prove you are the credential holder.
+
+## Generating a Proof (TypeScript/Bun)
+
+This is the core code pattern. Copy and adapt it.
+
+```typescript
+import { readFileSync } from 'fs'
+
+// Load the BBS+ blind interface (not the top-level bbs-signatures API)
+const blindIface = await import(
+  '@digitalbazaar/bbs-signatures/lib/bbs/blind/interface.js'
+)
+const ciphersuites = await import(
+  '@digitalbazaar/bbs-signatures/lib/bbs/ciphersuites.js'
+)
+const cs = ciphersuites.getCiphersuite('BLS12-381-SHA-256')
+
+// Load your credential
+const cred = JSON.parse(readFileSync('credential.json', 'utf-8'))
+
+// Choose which claims to disclose (by index)
+const DISCLOSED = [0, 1, 2, 7]  // subjectDid, domain, category, dnsVerified
+
+// Decode credential fields
+const header    = new Uint8Array(Buffer.from(cred.header, 'base64'))
+const signature = new Uint8Array(Buffer.from(cred.signature, 'base64'))
+const publicKey = new Uint8Array(Buffer.from(cred.publicKey, 'base64'))
+const messages  = cred.messages.map((m: string) => new TextEncoder().encode(m))
+const secretProverBlind = BigInt('0x' + cred.secretProverBlind)
+const holderSecret = new Uint8Array(Buffer.from(cred.holderSecret, 'base64'))
+
+// Generate the ZK proof
+const proof = await blindIface.BlindProofGen({
+  PK: publicKey,
+  signature,
+  header,
+  ph: new Uint8Array(),           // presentation header (empty is fine)
+  messages,                        // ALL 16 messages
+  disclosed_indexes: DISCLOSED,    // which ones to reveal
+  committed_messages: [holderSecret],
+  disclosed_commitment_indexes: [],
+  secret_prover_blind: secretProverBlind,
+  signer_blind: 0n,
+  ciphersuite: cs,
+})
+
+// Package as a proof bundle (this is what you transmit)
+const bundle = {
+  type: cred.type,
+  schema: cred.schema,
+  header: cred.header,
+  proof: Buffer.from(proof).toString('base64'),
+  publicKey: cred.publicKey,
+  ciphersuite: 'BLS12-381-SHA-256',
+  disclosedIndexes: DISCLOSED,
+  disclosedMessages: Object.fromEntries(
+    DISCLOSED.map(i => [i, cred.messages[i]])
+  ),
+  totalMessages: cred.messageCount,
+  blind: true,
+}
+
+// Base64 encode for transport (e.g. HTTP header)
+const headerValue = btoa(JSON.stringify(bundle))
+```
+
+**Important**: You pass ALL 16 messages to BlindProofGen, but only the `disclosed_indexes` are revealed in the proof. The rest remain zero-knowledge.
+
+## Verifying a Proof (TypeScript/Bun)
+
+```typescript
+const blindIface = await import(
+  '@digitalbazaar/bbs-signatures/lib/bbs/blind/interface.js'
+)
+const ciphersuites = await import(
+  '@digitalbazaar/bbs-signatures/lib/bbs/ciphersuites.js'
+)
+const cs = ciphersuites.getCiphersuite('BLS12-381-SHA-256')
+
+// Decode the proof bundle (from base64 header or file)
+const bundle = JSON.parse(atob(proofBase64))
+
+const proof     = new Uint8Array(Buffer.from(bundle.proof, 'base64'))
+const header    = new Uint8Array(Buffer.from(bundle.header, 'base64'))
+const publicKey = new Uint8Array(Buffer.from(bundle.publicKey, 'base64'))
+const messages  = bundle.disclosedIndexes.map(
+  (i: number) => new TextEncoder().encode(bundle.disclosedMessages[String(i)])
+)
+
+const valid = await blindIface.BlindProofVerify({
+  PK: publicKey,
+  proof,
+  header,
+  ph: new Uint8Array(),
+  L: bundle.totalMessages,          // REQUIRED: total message count (16)
+  disclosed_messages: messages,
+  disclosed_indexes: bundle.disclosedIndexes,
+  disclosed_committed_messages: [],
+  disclosed_committed_indexes: [],
+  ciphersuite: cs,
+})
+
+// valid === true means:
+// - Credential was issued by the holder of the public key
+// - Disclosed claims have not been tampered with
+// - Hidden claims exist but are not revealed (zero-knowledge)
+```
+
+**Critical**: The `L` parameter (total message count) is required for BlindProofVerify. Without it, verification silently returns false.
+
+## Serving in HTTP (Integration Pattern)
+
+Cache the proof (it's expensive to generate) and attach it to responses:
+
+```typescript
+let cached: string | null = null
+let cachedAt = 0
+const TTL = 60 * 60 * 1000  // 1 hour
+
+async function getProofHeader(): Promise<string | null> {
+  if (cached && Date.now() - cachedAt < TTL) return cached
+  cached = await generateAndEncodeProof()  // from above
+  cachedAt = Date.now()
+  return cached
+}
+
+// In your HTTP handler / middleware:
+const proof = await getProofHeader()
+if (proof) {
+  response.headers.set('X-Service-Credential', proof)
+}
+```
+
+Any caller can then read the header, decode it, and verify the proof without contacting QueryZero.
+
+## Dependency
+
+```json
+{ "@digitalbazaar/bbs-signatures": "3.0.0" }
+```
+
+This is the only runtime dependency. It provides the BLS12-381 pairing-based cryptography for BBS+ signatures.
+
+**Import note**: The blind signing interface is not exported from the package's top-level API. You must import from the internal paths:
+- `@digitalbazaar/bbs-signatures/lib/bbs/blind/interface.js` — BlindProofGen, BlindProofVerify, Commit
+- `@digitalbazaar/bbs-signatures/lib/bbs/ciphersuites.js` — getCiphersuite
+
+## Claim Index Reference
+
+### Service (QueryZeroServiceIdentity) — 16 claims
+| Idx | Key | What it proves |
+|-----|-----|----------------|
+| 0 | subjectDid | DID of the service (did:web:domain) |
+| 1 | serviceDomain | Domain name |
+| 2 | category | Service type (data-api, marketplace, etc.) |
+| 3 | operator | Registry operator |
+| 4 | registeredAt | When credential was issued |
+| 5 | paymentCapable | Accepts x402 payments |
+| 6 | paymentEndpoint | Payment URL |
+| 7 | dnsVerified | Passed DNS ownership challenge |
+| 8 | moltbookVerified | Social profile verified |
+| 9 | moltbookProfile | Social profile URL |
+| 10 | walletAddress | Ethereum wallet (Base network) |
+| 11 | usdcBlacklisted | USDC blacklist status |
+| 12 | emailVerified | Email verified |
+| 13 | kycVerified | KYC verified |
+| 14 | farcasterFid | Farcaster ID |
+| 15 | domainAge | Domain age in days |
+
+### Agent (QueryZeroAgentIdentity) — 16 claims
+| Idx | Key | What it proves |
+|-----|-----|----------------|
+| 0 | subjectDid | DID of the agent |
+| 1 | agentName | Agent identifier |
+| 2 | operator | Operating organization domain |
+| 3 | walletAddress | Ethereum wallet |
+| 4 | walletNetwork | Chain ID (default eip155:8453 = Base) |
+| 5 | paymentCapable | Accepts x402 payments |
+| 6 | moltbookAgent | Social username |
+| 7 | moltbookVerified | Social verification status |
+| 8 | farcasterFid | Farcaster ID |
+| 9 | farcasterVerified | Farcaster verification status |
+| 10-15 | (attestation slots) | Reserved for future attestations |
+
+## Registration (CLI — one-time setup)
+
+```bash
+# Install
+git clone https://github.com/mcyork/qz-toolkit.git && cd qz-toolkit && bun install
+(cd packages/qz-service && bun link) && (cd packages/qz-agent && bun link)
+
+# Agent registration (automatic — wallet signs nonce):
+qz-agent register my-agent --operator example.com --key 0xPRIVATE_KEY
+
+# Service registration (requires DNS step):
+qz-service register example.com --category data-api
+# → add DNS TXT record, then:
+qz-service verify example.com
+```
+
+After registration, the credential JSON is at `~/.qz/credentials/`. You can either integrate the proof generation code above into your runtime, or use the CLI tools directly.
+
+## CLI Usage (shell-out integration)
+
+If you can't or don't want to write TypeScript, you can generate and verify proofs entirely via CLI:
+
+```bash
+# Generate a proof (JSON to stdout, pipe-friendly):
+qz-agent proof my-agent --indexes 0,1,2,3
+
+# Service proof:
+qz-service proof example.com --indexes 1,2,7
+
+# Check credential status:
+qz-agent status my-agent
+qz-service status example.com
+
+# View the schema (all claim indexes and descriptions):
+qz-agent schema
+qz-service schema
+
+# Add attestations after registration:
+qz-agent attest farcaster my-agent
+qz-agent attest moltbook my-agent
+qz-service update example.com --wallet 0x... --wallet-sig 0x...
+qz-service update example.com --payment-capable --payment-endpoint https://example.com/pay
+
+# Serve proof as HTTP header and verify it:
+cd examples/service-proof && bun install
+bun run serve.ts example.com --port 3000
+bun run verify.ts http://localhost:3000
+
+# Verify any live service:
+bun run verify.ts https://invoices.org
+```
+
+The `proof` command outputs the full proof bundle as JSON to stdout. You can capture it, base64-encode it, and attach it to your HTTP responses — or pipe it directly:
+
+```bash
+qz-agent proof my-agent --indexes 0,1,2 | base64 | xargs -I{} curl -H "X-Agent-Credential: {}" https://target.com
+```
+
+## API Endpoints (for programmatic registration)
+
+Base: `https://queryzero.net` | Testnet: `http://testnet.queryzero.net`
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | /api/v1/agents/{name}/credential | Register agent (send wallet_address, operator, commitment) |
+| POST | /api/v1/agents/{name}/credential/verify | Submit signed nonce |
+| POST | /api/v1/services/{domain}/credential | Register service (send category, commitment) |
+| POST | /api/v1/services/{domain}/credential/verify | Trigger DNS verification |
+| GET | /api/v1/schemas/agent-identity-v1 | Agent schema |
+| GET | /api/v1/schemas/service-identity-v1 | Service schema |
+| GET | /api/v1/categories | Valid service categories |
+
+## Working Examples
+
+- `examples/service-proof/serve.ts` — HTTP server with proof in headers
+- `examples/service-proof/verify.ts` — Fetch and verify a proof from any URL

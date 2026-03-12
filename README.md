@@ -76,6 +76,10 @@ qz-agent register my-agent --operator example.com --key 0x... --url http://testn
 
 See the [examples/](examples/) directory for working integration samples.
 
+## For AI Agents
+
+See [`llms.txt`](llms.txt) for a machine-readable overview of this toolkit — what it does, how to register, and how to generate proofs.
+
 ## License
 
 MIT
