@@ -582,6 +582,55 @@ async function schemaCommand() {
   }
 }
 
+/**
+ * qz-service add-category --slug <slug> --name <name> --description <desc>
+ *
+ * Add a new service category (operator-only).
+ * Requires OPERATOR_KEY env var or --operator-key flag.
+ */
+async function addCategoryCommand() {
+  const slug = getFlag('--slug', '')
+  const name = getFlag('--name', '')
+  const description = getFlag('--description', '')
+  const operatorKey = getFlag('--operator-key', '') || process.env.OPERATOR_KEY || ''
+
+  if (!slug) die('--slug required (e.g. --slug credential-issuer)')
+  if (!name) die('--name required (e.g. --name "Credential Issuer")')
+  if (!description) die('--description required')
+  if (!operatorKey) die('OPERATOR_KEY env var or --operator-key required')
+
+  if (!/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/.test(slug)) {
+    die('Invalid slug: 3-63 chars, lowercase alphanumeric and hyphens, cannot start/end with hyphen')
+  }
+
+  console.log(`Adding category "${slug}"...`)
+
+  const res = await fetch(`${SERVER_URL}/api/v1/operator/categories`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${operatorKey}`,
+    },
+    body: JSON.stringify({ slug, name, description }),
+  })
+
+  const data = await res.json().catch(() => ({ error: 'Invalid response' }))
+
+  if (res.status >= 400) {
+    die(data.error || `Server returned ${res.status}`)
+  }
+
+  console.log('')
+  console.log('--- Category Created ---')
+  console.log('')
+  console.log(`  Slug:        ${data.category.slug}`)
+  console.log(`  Name:        ${data.category.name}`)
+  console.log(`  Description: ${data.category.description}`)
+  console.log('')
+  console.log('Services can now register with this category:')
+  console.log(`  qz-service register example.com --category ${slug}`)
+}
+
 // ---------------------------------------------------------------------------
 // Usage / dispatch
 // ---------------------------------------------------------------------------
@@ -600,6 +649,7 @@ Usage:
   qz-service proof <domain> --indexes 1,2,3     Derive ZK proof for specified claims
   qz-service schema                             View service identity schema
   qz-service categories                         List valid service categories
+  qz-service add-category                       Add a new category (operator-only)
 
 Register options:
   --category <type>          Service category (required)
@@ -611,6 +661,12 @@ Update options (add attestations after DNS verification):
   --payment-capable          Flag: service accepts x402 payments
   --payment-endpoint <url>   Payment endpoint URL
   --moltbook-profile <url>   Moltbook social profile URL
+
+Add-category options (operator-only):
+  --slug <slug>              Category slug (lowercase, hyphens, 3-63 chars)
+  --name <name>              Display name
+  --description <desc>       Category description
+  --operator-key <key>       Operator key (or set OPERATOR_KEY env var)
 
 Global options:
   --url <url>                QueryZero server URL (default: https://queryzero.net)
@@ -681,6 +737,10 @@ async function main() {
     }
     case 'categories': {
       await categoriesCommand()
+      break
+    }
+    case 'add-category': {
+      await addCategoryCommand()
       break
     }
     default: {
