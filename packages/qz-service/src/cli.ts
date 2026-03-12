@@ -292,7 +292,8 @@ async function verifyCommand(domain: string) {
   }
   console.log('')
   console.log(`  Credential saved to: ${credPath(domain)}`)
-  console.log('  Your holder secret is stored locally. Only you can derive proofs.')
+  console.log('  This file contains your holder secret — treat it as confidential.')
+  console.log('  Only you can derive proofs. Back it up; it cannot be re-downloaded.')
   console.log('  Use `qz-service proof` to derive proofs revealing only the claims you choose.')
 }
 

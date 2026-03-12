@@ -336,7 +336,8 @@ async function registerCommand(agentName: string) {
   }
   console.log('')
   console.log(`  Credential saved to: ${credPath(agentName)}`)
-  console.log('  Your holder secret is stored locally. Only you can derive proofs.')
+  console.log('  This file contains your holder secret — treat it as confidential.')
+  console.log('  Only you can derive proofs. Back it up; it cannot be re-downloaded.')
   console.log('  Use `qz-agent proof` to derive proofs revealing only the claims you choose.')
 }
 
