@@ -48,15 +48,9 @@ cd qz-toolkit
 bun install
 ```
 
-### Add commands to PATH
+That's it. The postinstall script automatically registers `qz-service`, `qz-sign-domain`, and `qz-agent` as global commands.
 
-```bash
-(cd packages/qz-service && bun link) && (cd packages/qz-agent && bun link)
-```
-
-This registers `qz-service`, `qz-sign-domain` (both from qz-service), and `qz-agent` as global commands you can run from anywhere.
-
-### Run directly (without install)
+### Run directly (without global install)
 
 ```bash
 bun packages/qz-service/src/cli.ts --help

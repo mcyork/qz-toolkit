@@ -5,6 +5,7 @@
   "license": "MIT",
   "private": true,
   "scripts": {
+    "postinstall": "cd packages/qz-service && bun link && cd ../qz-agent && bun link",
     "build": "cd packages/qz-service && bun run build && cd ../qz-agent && bun run build",
     "build:service": "cd packages/qz-service && bun run build",
     "build:agent": "cd packages/qz-agent && bun run build"
