@@ -582,34 +582,102 @@ async function schemaCommand() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Operator proof helper — auto-generates proof from local credential
+// ---------------------------------------------------------------------------
+
+function getOperatorDomain(): string {
+  try {
+    const url = new URL(SERVER_URL)
+    return url.hostname
+  } catch {
+    return SERVER_URL.replace(/^https?:\/\//, '').replace(/[:/].*$/, '')
+  }
+}
+
+async function generateOperatorProof(): Promise<string> {
+  const domain = getOperatorDomain()
+  const cred = loadCredential(domain)
+  if (!cred) {
+    die(`No local credential for operator domain "${domain}". Register first: qz-service register ${domain}`)
+  }
+  if (!cred.signature || !cred.blind || !cred.secretProverBlind || !cred.holderSecret) {
+    die(`Credential for "${domain}" is incomplete (missing signature or holder secret)`)
+  }
+
+  // Disclose index 1 (serviceDomain) — required by the server to verify operator identity
+  const disclosedIndexes = [1]
+  const header = new Uint8Array(Buffer.from(cred.header, 'base64'))
+  const signature = new Uint8Array(Buffer.from(cred.signature, 'base64'))
+  const publicKey = new Uint8Array(Buffer.from(cred.publicKey, 'base64'))
+  const messages = (cred.messages as string[]).map(
+    (m: string) => new TextEncoder().encode(m),
+  )
+  const secretProverBlind = BigInt('0x' + cred.secretProverBlind)
+  const holderSecret = new Uint8Array(Buffer.from(cred.holderSecret, 'base64'))
+
+  const { BlindProofGen, resolvedCiphersuite } = await getBlindModules()
+  const proof = await BlindProofGen({
+    PK: publicKey,
+    signature,
+    header,
+    ph: new Uint8Array(),
+    messages,
+    disclosed_indexes: disclosedIndexes,
+    committed_messages: [holderSecret],
+    disclosed_commitment_indexes: [],
+    secret_prover_blind: secretProverBlind,
+    signer_blind: 0n,
+    ciphersuite: resolvedCiphersuite,
+  })
+
+  const proofBundle = {
+    type: cred.type,
+    schema: cred.schema,
+    header: cred.header,
+    proof: Buffer.from(proof).toString('base64'),
+    publicKey: cred.publicKey,
+    ciphersuite: CIPHERSUITE,
+    disclosedIndexes,
+    disclosedMessages: Object.fromEntries(
+      disclosedIndexes.map((i: number) => [i, cred.messages[i]]),
+    ),
+    totalMessages: cred.messageCount,
+    blind: true,
+  }
+
+  return btoa(JSON.stringify(proofBundle))
+}
+
 /**
  * qz-service add-category --slug <slug> --name <name> --description <desc>
  *
  * Add a new service category (operator-only).
- * Requires OPERATOR_KEY env var or --operator-key flag.
+ * Authenticates via ZK proof of operator's service credential.
  */
 async function addCategoryCommand() {
   const slug = getFlag('--slug', '')
   const name = getFlag('--name', '')
   const description = getFlag('--description', '')
-  const operatorKey = getFlag('--operator-key', '') || process.env.OPERATOR_KEY || ''
 
   if (!slug) die('--slug required (e.g. --slug credential-issuer)')
   if (!name) die('--name required (e.g. --name "Credential Issuer")')
   if (!description) die('--description required')
-  if (!operatorKey) die('OPERATOR_KEY env var or --operator-key required')
 
   if (!/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/.test(slug)) {
     die('Invalid slug: 3-63 chars, lowercase alphanumeric and hyphens, cannot start/end with hyphen')
   }
 
   console.log(`Adding category "${slug}"...`)
+  console.log(`  Generating operator proof from ${getOperatorDomain()} credential...`)
+
+  const proofHeader = await generateOperatorProof()
 
   const res = await fetch(`${SERVER_URL}/api/v1/operator/categories`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${operatorKey}`,
+      'X-Operator-Credential': proofHeader,
     },
     body: JSON.stringify({ slug, name, description }),
   })
@@ -662,11 +730,10 @@ Update options (add attestations after DNS verification):
   --payment-endpoint <url>   Payment endpoint URL
   --moltbook-profile <url>   Moltbook social profile URL
 
-Add-category options (operator-only):
+Add-category options (operator-only, authenticates via local credential proof):
   --slug <slug>              Category slug (lowercase, hyphens, 3-63 chars)
   --name <name>              Display name
   --description <desc>       Category description
-  --operator-key <key>       Operator key (or set OPERATOR_KEY env var)
 
 Global options:
   --url <url>                QueryZero server URL (default: https://queryzero.net)
