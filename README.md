@@ -50,14 +50,11 @@ bun install
 
 ### Add commands to PATH
 
-This registers `qz-service`, `qz-sign-domain`, and `qz-agent` as global commands:
-
 ```bash
-cd packages/qz-service && bun link && cd ../..
-cd packages/qz-agent && bun link && cd ../..
+(cd packages/qz-service && bun link) && (cd packages/qz-agent && bun link)
 ```
 
-After this, you can run `qz-service`, `qz-sign-domain`, and `qz-agent` from anywhere.
+This registers `qz-service`, `qz-sign-domain` (both from qz-service), and `qz-agent` as global commands you can run from anywhere.
 
 ### Run directly (without install)
 
