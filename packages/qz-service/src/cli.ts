@@ -80,15 +80,19 @@ function die(message: string): never {
  * in a _qz DNS TXT record to prove domain ownership.
  */
 async function registerCommand(domain: string) {
-  const category = getFlag('--category', 'general')
+  const category = getFlag('--category', '')
+  const endpoint = getFlag('--endpoint', '')
   const wallet = getFlag('--wallet', '')
   const paymentCapable = hasFlag('--payment-capable')
   const paymentEndpoint = getFlag('--payment-endpoint', '')
   const moltbookProfile = getFlag('--moltbook-profile', '')
 
+  if (!category) die('--category required. Use `qz-service categories` to list valid options.')
+
   console.log(`Requesting credential for ${domain}...`)
 
   const body: Record<string, any> = { category }
+  if (endpoint) body.endpoint = endpoint
   if (wallet) body.walletAddress = wallet
   if (paymentCapable) body.paymentCapable = true
   if (paymentEndpoint) body.paymentEndpoint = paymentEndpoint
@@ -103,21 +107,32 @@ async function registerCommand(domain: string) {
   console.log('')
   console.log('--- DNS Challenge ---')
   console.log('')
-  console.log(`  Nonce: ${data.nonce}`)
-  console.log('')
   console.log('  Add a TXT record to your DNS:')
   console.log('')
   console.log(`    Host:  _qz.${domain}`)
   console.log(`    Value: ${data.dnsChallenge}`)
   console.log('')
-  console.log('  Common DNS providers:')
-  console.log('    Cloudflare: DNS > Add Record > TXT > Name: _qz > Content: <value>')
-  console.log('    Namecheap:  Advanced DNS > Add TXT Record > Host: _qz > Value: <value>')
-  console.log('    GoDaddy:    DNS Management > Add > TXT > Name: _qz > Value: <value>')
-  console.log('')
-  console.log('  After the record propagates (typically 1-5 minutes), run:')
+  console.log('  This record becomes the permanent service discovery record.')
+  console.log('  After DNS propagation (typically 1-5 minutes), run:')
   console.log('')
   console.log(`    qz-service verify ${domain}`)
+  console.log('')
+}
+
+/**
+ * qz-service categories
+ *
+ * List valid service categories from the server.
+ */
+async function categoriesCommand() {
+  const data = await apiGet('/api/v1/categories')
+
+  console.log('')
+  console.log('--- Service Categories ---')
+  console.log('')
+  for (const cat of data.categories) {
+    console.log(`  ${cat.slug.padEnd(20)} ${cat.description}`)
+  }
   console.log('')
 }
 
@@ -296,9 +311,11 @@ Usage:
   qz-service status <domain>                    Display stored credential
   qz-service proof <domain> --indexes 1,2,3     Derive ZK proof for specified claims
   qz-service schema                             View service identity schema
+  qz-service categories                         List valid service categories
 
 Register options:
-  --category <type>          Service category (default: general)
+  --category <type>          Service category (required)
+  --endpoint <url>           Service endpoint URL
   --wallet <address>         Optional wallet address on Base
   --payment-capable          Flag: service accepts x402 payments
   --payment-endpoint <url>   Payment endpoint URL
@@ -309,7 +326,8 @@ Global options:
   --help                     Show this help
 
 Examples:
-  qz-service register api.example.com --category data-api
+  qz-service categories
+  qz-service register api.example.com --category dns-intelligence --endpoint https://api.example.com/lookup
   qz-service verify api.example.com
   qz-service status api.example.com
   qz-service proof api.example.com --indexes 1,7
@@ -353,6 +371,10 @@ async function main() {
     }
     case 'schema': {
       await schemaCommand()
+      break
+    }
+    case 'categories': {
+      await categoriesCommand()
       break
     }
     default: {
