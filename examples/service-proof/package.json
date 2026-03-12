@@ -1,0 +1,16 @@
+{
+  "name": "qz-service-proof-example",
+  "version": "1.0.0",
+  "description": "Example: serve and verify QueryZero service credential proofs",
+  "type": "module",
+  "scripts": {
+    "serve": "bun run serve.ts",
+    "verify": "bun run verify.ts"
+  },
+  "dependencies": {
+    "@digitalbazaar/bbs-signatures": "3.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
