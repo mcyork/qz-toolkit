@@ -3,14 +3,18 @@
  * qz-service — QueryZero Service Credential CLI
  *
  * Register your service domain with QueryZero and obtain a BBS+ credential
- * with ZK selective disclosure. Prove any subset of claims about your service
- * without revealing the rest.
+ * with ZK selective disclosure. Uses blind signing — the holder secret never
+ * leaves this machine. Only you can derive proofs.
  *
  * Usage: qz-service <command> [options]
  * Build: bun build src/cli.ts --compile --outfile dist/qz-service
  */
 
 import * as bbs from '@digitalbazaar/bbs-signatures'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
+import { join } from 'path'
+import { homedir } from 'os'
+import { randomBytes } from 'crypto'
 
 // ---------------------------------------------------------------------------
 // Argument parsing
@@ -40,6 +44,80 @@ function getFlagValues(name: string): number[] {
 
 const SERVER_URL = getFlag('--url', 'https://queryzero.net')
 const CIPHERSUITE = 'BLS12-381-SHA-256'
+
+// ---------------------------------------------------------------------------
+// Local credential storage (~/.qz/credentials/)
+// ---------------------------------------------------------------------------
+
+const QZ_DIR = join(homedir(), '.qz', 'credentials', 'services')
+
+function ensureQzDir() {
+  if (!existsSync(QZ_DIR)) {
+    mkdirSync(QZ_DIR, { recursive: true })
+  }
+}
+
+function credPath(domain: string): string {
+  return join(QZ_DIR, `${domain}.json`)
+}
+
+function pendingPath(domain: string): string {
+  return join(QZ_DIR, `${domain}.pending.json`)
+}
+
+function saveCredential(domain: string, data: any) {
+  ensureQzDir()
+  writeFileSync(credPath(domain), JSON.stringify(data, null, 2))
+}
+
+function loadCredential(domain: string): any | null {
+  const p = credPath(domain)
+  if (!existsSync(p)) return null
+  return JSON.parse(readFileSync(p, 'utf-8'))
+}
+
+function savePending(domain: string, data: any) {
+  ensureQzDir()
+  writeFileSync(pendingPath(domain), JSON.stringify(data, null, 2))
+}
+
+function loadPending(domain: string): any | null {
+  const p = pendingPath(domain)
+  if (!existsSync(p)) return null
+  return JSON.parse(readFileSync(p, 'utf-8'))
+}
+
+function deletePending(domain: string) {
+  const p = pendingPath(domain)
+  if (existsSync(p)) {
+    const { unlinkSync } = require('fs')
+    unlinkSync(p)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// BBS+ blind signing helpers
+// ---------------------------------------------------------------------------
+
+let _blindModules: any = null
+
+async function getBlindModules() {
+  if (_blindModules) return _blindModules
+  const blindIface = await import(
+    /* @vite-ignore */ '../node_modules/@digitalbazaar/bbs-signatures/lib/bbs/blind/interface.js'
+  )
+  const ciphersuites = await import(
+    /* @vite-ignore */ '../node_modules/@digitalbazaar/bbs-signatures/lib/bbs/ciphersuites.js'
+  )
+  const resolvedCiphersuite = ciphersuites.getCiphersuite(CIPHERSUITE)
+  _blindModules = {
+    Commit: blindIface.Commit,
+    BlindProofGen: blindIface.BlindProofGen,
+    BlindVerify: blindIface.BlindVerify,
+    resolvedCiphersuite,
+  }
+  return _blindModules
+}
 
 // ---------------------------------------------------------------------------
 // HTTP helpers
@@ -76,8 +154,7 @@ function die(message: string): never {
 /**
  * qz-service register <domain>
  *
- * Request a service credential. The server returns a nonce that must be placed
- * in a _qz DNS TXT record to prove domain ownership.
+ * Generate a holder secret locally, send commitment to server, get DNS challenge.
  */
 async function registerCommand(domain: string) {
   const category = getFlag('--category', '')
@@ -91,7 +168,18 @@ async function registerCommand(domain: string) {
 
   console.log(`Requesting credential for ${domain}...`)
 
-  const body: Record<string, any> = { category }
+  // Generate holder secret and commitment client-side
+  const { Commit, resolvedCiphersuite } = await getBlindModules()
+  const holderSecret = new TextEncoder().encode(`holderSecret=${randomBytes(32).toString('hex')}`)
+  const [commitmentWithProof, secretProverBlind] = await Commit({
+    committed_messages: [holderSecret],
+    ciphersuite: resolvedCiphersuite,
+  })
+
+  const body: Record<string, any> = {
+    category,
+    commitment: Buffer.from(commitmentWithProof).toString('base64'),
+  }
   if (endpoint) body.endpoint = endpoint
   if (wallet) body.walletAddress = wallet
   if (paymentCapable) body.paymentCapable = true
@@ -103,6 +191,15 @@ async function registerCommand(domain: string) {
   if (status >= 400) {
     die(data.error || `Server returned ${status}`)
   }
+
+  // Save pending state locally (secret + commitment for verify step)
+  savePending(domain, {
+    domain,
+    secretProverBlind: secretProverBlind.toString(16),
+    holderSecret: Buffer.from(holderSecret).toString('base64'),
+    nonce: data.nonce,
+    category,
+  })
 
   console.log('')
   console.log('--- DNS Challenge ---')
@@ -116,6 +213,8 @@ async function registerCommand(domain: string) {
   console.log('  After DNS propagation (typically 1-5 minutes), run:')
   console.log('')
   console.log(`    qz-service verify ${domain}`)
+  console.log('')
+  console.log('  Your holder secret has been saved locally. Only you can derive proofs.')
   console.log('')
 }
 
@@ -139,9 +238,15 @@ async function categoriesCommand() {
 /**
  * qz-service verify <domain>
  *
- * Verify the DNS challenge and receive the BBS+ credential.
+ * Verify the DNS challenge and receive the BBS+ blind-signed credential.
+ * Saves the credential locally with the holder secret.
  */
 async function verifyCommand(domain: string) {
+  const pending = loadPending(domain)
+  if (!pending) {
+    die(`No pending registration for ${domain}. Run 'qz-service register ${domain}' first.`)
+  }
+
   console.log(`Verifying DNS challenge for ${domain}...`)
 
   const { status, data } = await apiPost(`/api/v1/services/${domain}/credential/verify`)
@@ -162,6 +267,14 @@ async function verifyCommand(domain: string) {
     die(error)
   }
 
+  // Save credential locally with holder secret
+  saveCredential(domain, {
+    ...data,
+    secretProverBlind: pending.secretProverBlind,
+    holderSecret: pending.holderSecret,
+  })
+  deletePending(domain)
+
   console.log('')
   console.log('--- Credential Issued ---')
   console.log('')
@@ -171,46 +284,66 @@ async function verifyCommand(domain: string) {
   console.log(`  Expires:     ${data.expiresAt}`)
   console.log(`  Messages:    ${data.messageCount}`)
   console.log(`  Ciphersuite: ${data.ciphersuite}`)
+  console.log(`  Holder-bound: ${data.blind ? 'yes' : 'no'}`)
   console.log('')
   console.log('  Claims:')
   for (let i = 0; i < data.messages.length; i++) {
     console.log(`    [${i}] ${data.messages[i]}`)
   }
   console.log('')
-  console.log('Your service now has a BBS+ credential with ZK selective disclosure.')
-  console.log('Use `qz-service proof` to derive proofs revealing only the claims you choose.')
+  console.log(`  Credential saved to: ${credPath(domain)}`)
+  console.log('  Your holder secret is stored locally. Only you can derive proofs.')
+  console.log('  Use `qz-service proof` to derive proofs revealing only the claims you choose.')
 }
 
 /**
  * qz-service status <domain>
  *
- * Retrieve and display the stored credential.
+ * Display locally stored credential.
  */
 async function statusCommand(domain: string) {
-  console.log(`Fetching credential for ${domain}...`)
-
-  let data: any
-  try {
-    data = await apiGet(`/api/v1/services/${domain}/credential`)
-  } catch {
-    console.log(`No BBS+ credential found for ${domain}.`)
-    console.log(`Register with: qz-service register ${domain}`)
+  const cred = loadCredential(domain)
+  if (!cred) {
+    // Fall back to server
+    console.log(`No local credential for ${domain}. Checking server...`)
+    let data: any
+    try {
+      data = await apiGet(`/api/v1/services/${domain}/credential`)
+    } catch {
+      console.log(`No BBS+ credential found for ${domain}.`)
+      console.log(`Register with: qz-service register ${domain}`)
+      return
+    }
+    console.log('')
+    console.log(`--- Service Credential: ${domain} (server-side, no holder secret) ---`)
+    console.log('')
+    console.log(`  Type:        ${data.type}`)
+    console.log(`  ID:          ${data.credentialId}`)
+    console.log(`  Issued:      ${data.issuedAt}`)
+    console.log(`  Expires:     ${data.expiresAt}`)
+    console.log(`  Holder-bound: ${data.blind ? 'yes' : 'no'}`)
+    if (data.blind) {
+      console.log('  WARNING: This is a blind credential but no local copy found.')
+      console.log('  You cannot derive proofs without the holder secret.')
+    }
     return
   }
 
   console.log('')
   console.log(`--- Service Credential: ${domain} ---`)
   console.log('')
-  console.log(`  Type:        ${data.type}`)
-  console.log(`  ID:          ${data.credentialId}`)
-  console.log(`  Issued:      ${data.issuedAt}`)
-  console.log(`  Expires:     ${data.expiresAt}`)
-  console.log(`  Messages:    ${data.messageCount}`)
-  console.log(`  Ciphersuite: ${data.ciphersuite}`)
+  console.log(`  Type:        ${cred.type}`)
+  console.log(`  ID:          ${cred.credentialId}`)
+  console.log(`  Issued:      ${cred.issuedAt}`)
+  console.log(`  Expires:     ${cred.expiresAt}`)
+  console.log(`  Messages:    ${cred.messageCount}`)
+  console.log(`  Ciphersuite: ${cred.ciphersuite}`)
+  console.log(`  Holder-bound: ${cred.blind ? 'yes' : 'no'}`)
+  console.log(`  Has secret:  ${cred.secretProverBlind ? 'yes' : 'no'}`)
   console.log('')
   console.log('  Claims:')
-  for (let i = 0; i < data.messages.length; i++) {
-    console.log(`    [${String(i).padStart(2)}] ${data.messages[i]}`)
+  for (let i = 0; i < cred.messages.length; i++) {
+    console.log(`    [${String(i).padStart(2)}] ${cred.messages[i]}`)
   }
 }
 
@@ -218,17 +351,17 @@ async function statusCommand(domain: string) {
  * qz-service proof <domain> --indexes 1,2,3
  *
  * Derive a BBS+ ZK proof revealing only the specified message indexes.
+ * Uses the locally stored credential and holder secret.
  */
 async function proofCommand(domain: string, indexes: number[]) {
   if (indexes.length === 0) die('--indexes required (e.g. --indexes 1,2,3)')
 
-  console.error(`Loading credential for ${domain}...`)
-
-  let cred: any
-  try {
-    cred = await apiGet(`/api/v1/services/${domain}/credential`)
-  } catch {
-    die(`No credential found for ${domain}. Register first with: qz-service register ${domain}`)
+  const cred = loadCredential(domain)
+  if (!cred) {
+    die(`No local credential for ${domain}. Register first with: qz-service register ${domain}`)
+  }
+  if (!cred.signature) {
+    die('Credential has no signature. The server may have returned metadata only.')
   }
 
   const header = new Uint8Array(Buffer.from(cred.header, 'base64'))
@@ -245,14 +378,39 @@ async function proofCommand(domain: string, indexes: number[]) {
 
   console.error(`Deriving proof for indexes [${disclosedIndexes.join(', ')}]...`)
 
-  const proof = await bbs.deriveProof({
-    publicKey,
-    header,
-    signature,
-    messages,
-    disclosedMessageIndexes: disclosedIndexes,
-    ciphersuite: CIPHERSUITE,
-  })
+  let proof: Uint8Array
+
+  if (cred.blind && cred.secretProverBlind && cred.holderSecret) {
+    // Blind proof: requires holder secret
+    const { BlindProofGen, resolvedCiphersuite } = await getBlindModules()
+    const secretProverBlind = BigInt('0x' + cred.secretProverBlind)
+    const holderSecret = new Uint8Array(Buffer.from(cred.holderSecret, 'base64'))
+
+    proof = await BlindProofGen({
+      PK: publicKey,
+      signature,
+      header,
+      ph: new Uint8Array(),
+      messages,
+      disclosed_indexes: disclosedIndexes,
+      committed_messages: [holderSecret],
+      disclosed_commitment_indexes: [],
+      secret_prover_blind: secretProverBlind,
+      signer_blind: 0n,
+      ciphersuite: resolvedCiphersuite,
+    })
+  } else {
+    // Legacy non-blind proof
+    proof = await bbs.deriveProof({
+      publicKey,
+      header,
+      signature,
+      messages,
+      presentationHeader: new Uint8Array(),
+      disclosedMessageIndexes: disclosedIndexes,
+      ciphersuite: CIPHERSUITE,
+    })
+  }
 
   const proofBundle = {
     type: cred.type,
@@ -263,9 +421,10 @@ async function proofCommand(domain: string, indexes: number[]) {
     ciphersuite: CIPHERSUITE,
     disclosedIndexes,
     disclosedMessages: Object.fromEntries(
-      disclosedIndexes.map((i) => [i, cred.messages[i]]),
+      disclosedIndexes.map((i: number) => [i, cred.messages[i]]),
     ),
     totalMessages: cred.messageCount,
+    blind: cred.blind || false,
   }
 
   // Proof JSON goes to stdout (pipe-friendly)
@@ -303,7 +462,7 @@ function printUsage() {
   console.log(`qz-service — QueryZero Service Credential CLI
 
 Register your service domain with QueryZero and obtain a BBS+ credential
-with ZK selective disclosure.
+with ZK selective disclosure and holder binding.
 
 Usage:
   qz-service register <domain>                  Request credential (get DNS challenge)
@@ -324,6 +483,9 @@ Register options:
 Global options:
   --url <url>                QueryZero server URL (default: https://queryzero.net)
   --help                     Show this help
+
+Credentials are stored locally in ~/.qz/credentials/services/
+Your holder secret never leaves this machine.
 
 Examples:
   qz-service categories

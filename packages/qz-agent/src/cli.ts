@@ -3,17 +3,20 @@
  * qz-agent — QueryZero Agent Credential CLI
  *
  * Register your agent with QueryZero using wallet signing and obtain a BBS+
- * credential with ZK selective disclosure. Prove any subset of claims about
- * your agent without revealing the rest.
+ * credential with ZK selective disclosure. Uses blind signing — the holder
+ * secret never leaves this machine. Only you can derive proofs.
  *
  * Usage: qz-agent <command> [options]
  * Build: bun build src/cli.ts --compile --outfile dist/qz-agent
  */
 
 import * as bbs from '@digitalbazaar/bbs-signatures'
-import { createWalletClient, http, type PrivateKeyAccount } from 'viem'
+import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'fs'
+import { join } from 'path'
+import { homedir } from 'os'
+import { randomBytes } from 'crypto'
 import { privateKeyToAccount } from 'viem/accounts'
-import { base } from 'viem/chains'
+import type { PrivateKeyAccount } from 'viem'
 
 // ---------------------------------------------------------------------------
 // Argument parsing
@@ -43,6 +46,77 @@ function getFlagValues(name: string): number[] {
 
 const SERVER_URL = getFlag('--url', 'https://queryzero.net')
 const CIPHERSUITE = 'BLS12-381-SHA-256'
+
+// ---------------------------------------------------------------------------
+// Local credential storage (~/.qz/credentials/agents/)
+// ---------------------------------------------------------------------------
+
+const QZ_DIR = join(homedir(), '.qz', 'credentials', 'agents')
+
+function ensureQzDir() {
+  if (!existsSync(QZ_DIR)) {
+    mkdirSync(QZ_DIR, { recursive: true })
+  }
+}
+
+function credPath(agentName: string): string {
+  return join(QZ_DIR, `${agentName}.json`)
+}
+
+function pendingPath(agentName: string): string {
+  return join(QZ_DIR, `${agentName}.pending.json`)
+}
+
+function saveCredential(agentName: string, data: any) {
+  ensureQzDir()
+  writeFileSync(credPath(agentName), JSON.stringify(data, null, 2))
+}
+
+function loadCredential(agentName: string): any | null {
+  const p = credPath(agentName)
+  if (!existsSync(p)) return null
+  return JSON.parse(readFileSync(p, 'utf-8'))
+}
+
+function savePending(agentName: string, data: any) {
+  ensureQzDir()
+  writeFileSync(pendingPath(agentName), JSON.stringify(data, null, 2))
+}
+
+function loadPending(agentName: string): any | null {
+  const p = pendingPath(agentName)
+  if (!existsSync(p)) return null
+  return JSON.parse(readFileSync(p, 'utf-8'))
+}
+
+function deletePending(agentName: string) {
+  const p = pendingPath(agentName)
+  if (existsSync(p)) unlinkSync(p)
+}
+
+// ---------------------------------------------------------------------------
+// BBS+ blind signing helpers
+// ---------------------------------------------------------------------------
+
+let _blindModules: any = null
+
+async function getBlindModules() {
+  if (_blindModules) return _blindModules
+  const blindIface = await import(
+    /* @vite-ignore */ '../node_modules/@digitalbazaar/bbs-signatures/lib/bbs/blind/interface.js'
+  )
+  const ciphersuites = await import(
+    /* @vite-ignore */ '../node_modules/@digitalbazaar/bbs-signatures/lib/bbs/ciphersuites.js'
+  )
+  const resolvedCiphersuite = ciphersuites.getCiphersuite(CIPHERSUITE)
+  _blindModules = {
+    Commit: blindIface.Commit,
+    BlindProofGen: blindIface.BlindProofGen,
+    BlindVerify: blindIface.BlindVerify,
+    resolvedCiphersuite,
+  }
+  return _blindModules
+}
 
 // ---------------------------------------------------------------------------
 // Wallet helpers
@@ -98,14 +172,84 @@ function die(message: string): never {
 }
 
 // ---------------------------------------------------------------------------
+// Proof generation helper (used by proof command and attestation commands)
+// ---------------------------------------------------------------------------
+
+async function generateProof(cred: any, disclosedIndexes: number[]): Promise<string> {
+  const header = new Uint8Array(Buffer.from(cred.header, 'base64'))
+  const signature = new Uint8Array(Buffer.from(cred.signature, 'base64'))
+  const publicKey = new Uint8Array(Buffer.from(cred.publicKey, 'base64'))
+  const messages = (cred.messages as string[]).map(
+    (m: string) => new TextEncoder().encode(m),
+  )
+
+  let proof: Uint8Array
+
+  if (cred.blind && cred.secretProverBlind && cred.holderSecret) {
+    const { BlindProofGen, resolvedCiphersuite } = await getBlindModules()
+    const secretProverBlind = BigInt('0x' + cred.secretProverBlind)
+    const holderSecret = new Uint8Array(Buffer.from(cred.holderSecret, 'base64'))
+
+    proof = await BlindProofGen({
+      PK: publicKey,
+      signature,
+      header,
+      ph: new Uint8Array(),
+      messages,
+      disclosed_indexes: disclosedIndexes,
+      committed_messages: [holderSecret],
+      disclosed_commitment_indexes: [],
+      secret_prover_blind: secretProverBlind,
+      signer_blind: 0n,
+      ciphersuite: resolvedCiphersuite,
+    })
+  } else {
+    proof = await bbs.deriveProof({
+      publicKey,
+      header,
+      signature,
+      messages,
+      presentationHeader: new Uint8Array(),
+      disclosedMessageIndexes: disclosedIndexes,
+      ciphersuite: CIPHERSUITE,
+    })
+  }
+
+  return Buffer.from(proof).toString('base64')
+}
+
+// ---------------------------------------------------------------------------
+// Commitment generation helper (used by register and attestation re-issuance)
+// ---------------------------------------------------------------------------
+
+async function generateCommitment(): Promise<{
+  commitmentBase64: string
+  secretProverBlind: string
+  holderSecretBase64: string
+}> {
+  const { Commit, resolvedCiphersuite } = await getBlindModules()
+  const holderSecret = new TextEncoder().encode(`holderSecret=${randomBytes(32).toString('hex')}`)
+  const [commitmentWithProof, secretProverBlind] = await Commit({
+    committed_messages: [holderSecret],
+    ciphersuite: resolvedCiphersuite,
+  })
+
+  return {
+    commitmentBase64: Buffer.from(commitmentWithProof).toString('base64'),
+    secretProverBlind: secretProverBlind.toString(16),
+    holderSecretBase64: Buffer.from(holderSecret).toString('base64'),
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
 /**
  * qz-agent register <agentName>
  *
- * Request an agent credential. The server returns a nonce that must be signed
- * with the wallet private key to prove ownership.
+ * Generate holder secret, send commitment + wallet signature to server,
+ * receive blind-signed credential and save locally.
  */
 async function registerCommand(agentName: string) {
   const account = getAccount()
@@ -120,10 +264,14 @@ async function registerCommand(agentName: string) {
   console.log(`  Wallet: ${account.address}`)
   console.log(`  Operator: ${operator}`)
 
+  // Generate holder secret and commitment client-side
+  const { commitmentBase64, secretProverBlind, holderSecretBase64 } = await generateCommitment()
+
   const body: Record<string, any> = {
     wallet_address: account.address,
     operator,
     wallet_network: walletNetwork,
+    commitment: commitmentBase64,
   }
   if (moltbookAgent) body.moltbook_agent = moltbookAgent
   if (paymentCapable) body.payment_capable = true
@@ -133,6 +281,15 @@ async function registerCommand(agentName: string) {
   if (status >= 400) {
     die(data.error || `Server returned ${status}`)
   }
+
+  // Save pending state (secret for after verify step)
+  savePending(agentName, {
+    agentName,
+    secretProverBlind,
+    holderSecret: holderSecretBase64,
+    nonce: data.nonce,
+    wallet: account.address,
+  })
 
   // Auto-sign the nonce
   console.log('')
@@ -148,10 +305,20 @@ async function registerCommand(agentName: string) {
   })
 
   if (verifyResult.status >= 400) {
+    deletePending(agentName)
     die(verifyResult.data.error || `Verification failed (${verifyResult.status})`)
   }
 
   const cred = verifyResult.data.credential || verifyResult.data
+
+  // Save credential locally with holder secret
+  saveCredential(agentName, {
+    ...cred,
+    secretProverBlind,
+    holderSecret: holderSecretBase64,
+  })
+  deletePending(agentName)
+
   console.log('')
   console.log('--- Credential Issued ---')
   console.log('')
@@ -161,34 +328,52 @@ async function registerCommand(agentName: string) {
   console.log(`  Expires:     ${cred.expiresAt}`)
   console.log(`  Messages:    ${cred.messageCount}`)
   console.log(`  Ciphersuite: ${cred.ciphersuite}`)
+  console.log(`  Holder-bound: ${cred.blind ? 'yes' : 'no'}`)
   console.log('')
   console.log('  Claims:')
   for (let i = 0; i < cred.messages.length; i++) {
     console.log(`    [${String(i).padStart(2)}] ${cred.messages[i]}`)
   }
   console.log('')
-  console.log('Your agent now has a BBS+ credential with ZK selective disclosure.')
-  console.log('Use `qz-agent proof` to derive proofs revealing only the claims you choose.')
+  console.log(`  Credential saved to: ${credPath(agentName)}`)
+  console.log('  Your holder secret is stored locally. Only you can derive proofs.')
+  console.log('  Use `qz-agent proof` to derive proofs revealing only the claims you choose.')
 }
 
 /**
  * qz-agent status <agentName>
  *
- * Retrieve and display the stored credential.
+ * Display locally stored credential, fall back to server.
  */
 async function statusCommand(agentName: string) {
-  console.log(`Fetching credential for agent "${agentName}"...`)
-
-  let data: any
-  try {
-    data = await apiGet(`/api/v1/agents/${agentName}/credential`)
-  } catch {
-    console.log(`No BBS+ credential found for agent "${agentName}".`)
-    console.log(`Register with: qz-agent register ${agentName} --operator <domain> --key <key>`)
+  const cred = loadCredential(agentName)
+  if (!cred) {
+    // Fall back to server
+    console.log(`No local credential for "${agentName}". Checking server...`)
+    let data: any
+    try {
+      data = await apiGet(`/api/v1/agents/${agentName}/credential`)
+    } catch {
+      console.log(`No BBS+ credential found for agent "${agentName}".`)
+      console.log(`Register with: qz-agent register ${agentName} --operator <domain> --key <key>`)
+      return
+    }
+    const c = data.credential || data
+    console.log('')
+    console.log(`--- Agent Credential: ${agentName} (server-side, no holder secret) ---`)
+    console.log('')
+    console.log(`  Type:        ${c.type}`)
+    console.log(`  ID:          ${c.credentialId}`)
+    console.log(`  Issued:      ${c.issuedAt}`)
+    console.log(`  Expires:     ${c.expiresAt}`)
+    console.log(`  Holder-bound: ${c.blind ? 'yes' : 'no'}`)
+    if (c.blind) {
+      console.log('  WARNING: This is a blind credential but no local copy found.')
+      console.log('  You cannot derive proofs without the holder secret.')
+    }
     return
   }
 
-  const cred = data.credential || data
   console.log('')
   console.log(`--- Agent Credential: ${agentName} ---`)
   console.log('')
@@ -198,6 +383,8 @@ async function statusCommand(agentName: string) {
   console.log(`  Expires:     ${cred.expiresAt}`)
   console.log(`  Messages:    ${cred.messageCount}`)
   console.log(`  Ciphersuite: ${cred.ciphersuite}`)
+  console.log(`  Holder-bound: ${cred.blind ? 'yes' : 'no'}`)
+  console.log(`  Has secret:  ${cred.secretProverBlind ? 'yes' : 'no'}`)
   console.log('')
   console.log('  Claims:')
   for (let i = 0; i < cred.messages.length; i++) {
@@ -209,55 +396,41 @@ async function statusCommand(agentName: string) {
  * qz-agent proof <agentName> --indexes 1,2,3
  *
  * Derive a BBS+ ZK proof revealing only the specified message indexes.
+ * Uses the locally stored credential and holder secret.
  */
 async function proofCommand(agentName: string, indexes: number[]) {
   if (indexes.length === 0) die('--indexes required (e.g. --indexes 1,2,3)')
 
-  console.error(`Loading credential for agent "${agentName}"...`)
-
-  let data: any
-  try {
-    data = await apiGet(`/api/v1/agents/${agentName}/credential`)
-  } catch {
-    die(`No credential found for agent "${agentName}". Register first with: qz-agent register ${agentName}`)
+  const cred = loadCredential(agentName)
+  if (!cred) {
+    die(`No local credential for "${agentName}". Register first with: qz-agent register ${agentName}`)
   }
-
-  const cred = data.credential || data
-  const header = new Uint8Array(Buffer.from(cred.header, 'base64'))
-  const signature = new Uint8Array(Buffer.from(cred.signature, 'base64'))
-  const publicKey = new Uint8Array(Buffer.from(cred.publicKey, 'base64'))
-  const messages = (cred.messages as string[]).map(
-    (m: string) => new TextEncoder().encode(m),
-  )
+  if (!cred.signature) {
+    die('Credential has no signature. The server may have returned metadata only.')
+  }
 
   const disclosedIndexes = indexes.sort((a, b) => a - b)
   for (const i of disclosedIndexes) {
-    if (i < 0 || i >= messages.length) die(`index ${i} out of range (0-${messages.length - 1})`)
+    if (i < 0 || i >= cred.messages.length) die(`index ${i} out of range (0-${cred.messages.length - 1})`)
   }
 
   console.error(`Deriving proof for indexes [${disclosedIndexes.join(', ')}]...`)
 
-  const proof = await bbs.deriveProof({
-    publicKey,
-    header,
-    signature,
-    messages,
-    disclosedMessageIndexes: disclosedIndexes,
-    ciphersuite: CIPHERSUITE,
-  })
+  const proofBase64 = await generateProof(cred, disclosedIndexes)
 
   const proofBundle = {
     type: cred.type,
     schema: cred.schema,
     header: cred.header,
-    proof: Buffer.from(proof).toString('base64'),
+    proof: proofBase64,
     publicKey: cred.publicKey,
     ciphersuite: CIPHERSUITE,
     disclosedIndexes,
     disclosedMessages: Object.fromEntries(
-      disclosedIndexes.map((i) => [i, cred.messages[i]]),
+      disclosedIndexes.map((i: number) => [i, cred.messages[i]]),
     ),
     totalMessages: cred.messageCount,
+    blind: cred.blind || false,
   }
 
   // Proof JSON goes to stdout (pipe-friendly)
@@ -326,6 +499,8 @@ async function attestMoltbookCommand(agentName: string) {
  * qz-agent attest moltbook-verify <agentName> --comment-id <id>
  *
  * Verify a Moltbook comment and re-issue credential with moltbookVerified=true.
+ * For blind credentials: sends ZK proof (disclosing subjectDid at index 0)
+ * and a new commitment for re-issuance.
  */
 async function attestMoltbookVerifyCommand(agentName: string) {
   const commentId = getFlag('--comment-id', '')
@@ -333,46 +508,109 @@ async function attestMoltbookVerifyCommand(agentName: string) {
 
   console.log(`Verifying Moltbook comment for agent "${agentName}"...`)
 
-  const { status, data } = await apiPost(`/api/v1/agents/${agentName}/credential/moltbook/verify`, {
-    comment_id: commentId,
-  })
+  const cred = loadCredential(agentName)
+  const body: Record<string, any> = { comment_id: commentId }
+
+  let newSecretProverBlind: string | undefined
+  let newHolderSecretBase64: string | undefined
+
+  if (cred && cred.blind && cred.secretProverBlind && cred.signature) {
+    // Generate proof disclosing subjectDid (index 0) for authentication
+    console.log('  Generating ZK proof for authentication...')
+    body.proof = await generateProof(cred, [0])
+
+    // Generate new commitment for re-issuance
+    console.log('  Generating new commitment for re-issuance...')
+    const commit = await generateCommitment()
+    body.commitment = commit.commitmentBase64
+    newSecretProverBlind = commit.secretProverBlind
+    newHolderSecretBase64 = commit.holderSecretBase64
+  }
+
+  const { status, data } = await apiPost(`/api/v1/agents/${agentName}/credential/moltbook/verify`, body)
 
   if (status >= 400) {
     die(data.error || `Server returned ${status}`)
   }
 
-  const cred = data.credential || data
+  const newCred = data.credential || data
+
+  // Save updated credential locally
+  if (newCred.signature) {
+    saveCredential(agentName, {
+      ...newCred,
+      secretProverBlind: newSecretProverBlind || cred?.secretProverBlind,
+      holderSecret: newHolderSecretBase64 || cred?.holderSecret,
+    })
+  }
+
   console.log('')
   console.log('--- Moltbook Attestation Complete ---')
   console.log('')
   console.log(`  Status: ${data.status}`)
-  console.log(`  ID:     ${cred.credentialId}`)
+  console.log(`  ID:     ${newCred.credentialId}`)
   console.log('')
   console.log('Credential re-issued with moltbookVerified=true.')
+  if (newCred.signature) {
+    console.log(`Saved to: ${credPath(agentName)}`)
+  }
 }
 
 /**
  * qz-agent attest farcaster <agentName>
  *
  * Look up Farcaster identity by wallet address and re-issue credential.
+ * For blind credentials: sends ZK proof and new commitment.
  */
 async function attestFarcasterCommand(agentName: string) {
   console.log(`Requesting Farcaster attestation for agent "${agentName}"...`)
 
-  const { status, data } = await apiPost(`/api/v1/agents/${agentName}/credential/farcaster`)
+  const cred = loadCredential(agentName)
+  const body: Record<string, any> = {}
+
+  let newSecretProverBlind: string | undefined
+  let newHolderSecretBase64: string | undefined
+
+  if (cred && cred.blind && cred.secretProverBlind && cred.signature) {
+    // Generate proof disclosing subjectDid (index 0) for authentication
+    console.log('  Generating ZK proof for authentication...')
+    body.proof = await generateProof(cred, [0])
+
+    // Generate new commitment for re-issuance
+    console.log('  Generating new commitment for re-issuance...')
+    const commit = await generateCommitment()
+    body.commitment = commit.commitmentBase64
+    newSecretProverBlind = commit.secretProverBlind
+    newHolderSecretBase64 = commit.holderSecretBase64
+  }
+
+  const { status, data } = await apiPost(`/api/v1/agents/${agentName}/credential/farcaster`, body)
 
   if (status >= 400) {
     die(data.error || `Server returned ${status}`)
   }
 
-  const cred = data.credential || data
+  const newCred = data.credential || data
+
+  // Save updated credential locally
+  if (newCred.signature) {
+    saveCredential(agentName, {
+      ...newCred,
+      secretProverBlind: newSecretProverBlind || cred?.secretProverBlind,
+      holderSecret: newHolderSecretBase64 || cred?.holderSecret,
+    })
+  }
+
   console.log('')
   console.log('--- Farcaster Attestation Complete ---')
   console.log('')
   console.log(`  Status: ${data.status}`)
-  console.log(`  ID:     ${cred.credentialId}`)
+  console.log(`  ID:     ${newCred.credentialId}`)
   console.log('')
   console.log('Credential re-issued with Farcaster identity.')
+  if (newCred.signature) {
+    console.log(`Saved to: ${credPath(agentName)}`)
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -383,7 +621,7 @@ function printUsage() {
   console.log(`qz-agent — QueryZero Agent Credential CLI
 
 Register your agent with QueryZero using wallet signing and obtain a BBS+
-credential with ZK selective disclosure.
+credential with ZK selective disclosure and holder binding.
 
 Usage:
   qz-agent register <agentName>                  Register and receive credential
@@ -406,6 +644,9 @@ Wallet options:
 Global options:
   --url <url>                  QueryZero server URL (default: https://queryzero.net)
   --help                       Show this help
+
+Credentials are stored locally in ~/.qz/credentials/agents/
+Your holder secret never leaves this machine.
 
 Examples:
   qz-agent register my-agent --operator example.com --key 0x...
