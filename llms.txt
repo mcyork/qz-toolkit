@@ -230,7 +230,6 @@ This is the only runtime dependency. It provides the BLS12-381 pairing-based cry
 ```bash
 # Install
 git clone https://github.com/mcyork/qz-toolkit.git && cd qz-toolkit && bun install
-(cd packages/qz-service && bun link) && (cd packages/qz-agent && bun link)
 
 # Agent registration (automatic — wallet signs nonce):
 qz-agent register my-agent --operator example.com --key 0xPRIVATE_KEY

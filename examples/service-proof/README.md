@@ -19,8 +19,8 @@ bun install
 ## Register a credential (if you don't have one)
 
 ```bash
-# From the repo root — install qz-service first:
-(cd packages/qz-service && bun link)
+# From the repo root — install and register CLI tools:
+cd ../.. && bun install
 
 # Register with testnet:
 qz-service register myservice.com --category data-api --url http://testnet.queryzero.net
