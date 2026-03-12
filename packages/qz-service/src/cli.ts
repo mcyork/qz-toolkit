@@ -433,10 +433,12 @@ async function proofCommand(domain: string, indexes: number[]) {
 }
 
 /**
- * qz-service update <domain> [--wallet <addr>] [--payment-capable] [--payment-endpoint <url>] [--moltbook-profile <url>]
+ * qz-service update <domain> [--wallet <addr> --wallet-sig <sig>] [--payment-capable] [--payment-endpoint <url>] [--moltbook-profile <url>]
  *
  * Update an existing credential with new attestation fields.
  * Uses ZK proof to authenticate as the credential holder.
+ * Wallet additions require an ECDSA signature proving ownership —
+ * sign your domain name with your wallet using any tool you trust.
  * Re-issues with a new blind signature.
  */
 async function updateCommand(domain: string) {
@@ -449,6 +451,7 @@ async function updateCommand(domain: string) {
   }
 
   const wallet = getFlag('--wallet', '')
+  const walletSig = getFlag('--wallet-sig', '')
   const paymentCapable = hasFlag('--payment-capable')
   const paymentEndpoint = getFlag('--payment-endpoint', '')
   const moltbookProfile = getFlag('--moltbook-profile', '')
@@ -457,10 +460,36 @@ async function updateCommand(domain: string) {
     die('At least one update required: --wallet, --payment-capable, --payment-endpoint, --moltbook-profile')
   }
 
+  if (wallet && !walletSig) {
+    console.error('error: --wallet-sig required when adding a wallet.')
+    console.error('')
+    console.error('You must prove wallet ownership by signing your domain name.')
+    console.error('Sign the exact string "' + domain + '" with your wallet using any tool you trust:')
+    console.error('')
+    console.error('  # Foundry (cast)')
+    console.error(`  cast wallet sign "${domain}" --private-key <your-key>`)
+    console.error('')
+    console.error('  # Node.js (viem)')
+    console.error(`  import { privateKeyToAccount } from 'viem/accounts'`)
+    console.error(`  const sig = await privateKeyToAccount('0x...').signMessage({ message: '${domain}' })`)
+    console.error('')
+    console.error('  # MetaMask (browser console)')
+    console.error(`  await ethereum.request({ method: 'personal_sign', params: ['${domain}', '<your-address>'] })`)
+    console.error('')
+    console.error('Then pass the signature:')
+    console.error(`  qz-service update ${domain} --wallet <address> --wallet-sig <0x-signature>`)
+    process.exit(1)
+  }
+
   console.log(`Updating credential for ${domain}...`)
 
   const body: Record<string, any> = {}
-  if (wallet) { body.walletAddress = wallet; console.log(`  Adding wallet: ${wallet}`) }
+  if (wallet) {
+    body.walletAddress = wallet
+    body.walletSignature = walletSig
+    console.log(`  Adding wallet: ${wallet}`)
+    console.log(`  Wallet signature: ${walletSig.slice(0, 10)}...${walletSig.slice(-6)}`)
+  }
   if (paymentCapable) { body.paymentCapable = true; console.log('  Enabling payments') }
   if (paymentEndpoint) { body.paymentEndpoint = paymentEndpoint; console.log(`  Payment endpoint: ${paymentEndpoint}`) }
   if (moltbookProfile) { body.moltbookProfile = moltbookProfile; console.log(`  Moltbook profile: ${moltbookProfile}`) }
@@ -581,6 +610,7 @@ Register options:
 
 Update options (add attestations after DNS verification):
   --wallet <address>         Wallet address on Base (triggers KYC/Farcaster checks)
+  --wallet-sig <signature>   ECDSA signature proving wallet ownership (sign the domain name)
   --payment-capable          Flag: service accepts x402 payments
   --payment-endpoint <url>   Payment endpoint URL
   --moltbook-profile <url>   Moltbook social profile URL
@@ -596,9 +626,15 @@ Examples:
   qz-service categories
   qz-service register api.example.com --category dns-intelligence --endpoint https://api.example.com/lookup
   qz-service verify api.example.com
+  qz-service update api.example.com --wallet 0x... --wallet-sig 0x...
+  qz-service update api.example.com --payment-capable --payment-endpoint https://api.example.com/pay
   qz-service status api.example.com
   qz-service proof api.example.com --indexes 1,7
   qz-service schema
+
+Wallet signature: to add a wallet, sign your domain name with your wallet key.
+  cast wallet sign "api.example.com" --private-key <key>    # Foundry
+  See --help for MetaMask and Node.js examples.
 `)
 }
 
