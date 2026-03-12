@@ -14,6 +14,20 @@ qz-service verify api.example.com
 qz-service proof api.example.com --indexes 1,7,11
 ```
 
+### qz-sign-domain
+
+Sign your domain name with your wallet private key to prove ownership. Your key is used locally and never transmitted.
+
+```bash
+qz-sign-domain invoices.org --key 0x...
+```
+
+Then use the output to add your wallet to your service credential:
+
+```bash
+qz-service update invoices.org --wallet <address> --wallet-sig <signature>
+```
+
 ### qz-agent
 
 Register your agent via wallet signing and receive a BBS+ credential. Supports optional attestations (Moltbook, Farcaster).
@@ -34,20 +48,22 @@ cd qz-toolkit
 bun install
 ```
 
-### Run directly
+### Add commands to PATH
+
+This registers `qz-service`, `qz-sign-domain`, and `qz-agent` as global commands:
+
+```bash
+cd packages/qz-service && bun link && cd ../..
+cd packages/qz-agent && bun link && cd ../..
+```
+
+After this, you can run `qz-service`, `qz-sign-domain`, and `qz-agent` from anywhere.
+
+### Run directly (without install)
 
 ```bash
 bun packages/qz-service/src/cli.ts --help
 bun packages/qz-agent/src/cli.ts --help
-```
-
-### Compile to binaries
-
-```bash
-bun run build
-# Produces:
-#   packages/qz-service/dist/qz-service
-#   packages/qz-agent/dist/qz-agent
 ```
 
 ## Testnet
