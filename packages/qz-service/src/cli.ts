@@ -433,6 +433,107 @@ async function proofCommand(domain: string, indexes: number[]) {
 }
 
 /**
+ * qz-service update <domain> [--wallet <addr>] [--payment-capable] [--payment-endpoint <url>] [--moltbook-profile <url>]
+ *
+ * Update an existing credential with new attestation fields.
+ * Uses ZK proof to authenticate as the credential holder.
+ * Re-issues with a new blind signature.
+ */
+async function updateCommand(domain: string) {
+  const cred = loadCredential(domain)
+  if (!cred) {
+    die(`No local credential for ${domain}. Register first with: qz-service register ${domain}`)
+  }
+  if (!cred.signature) {
+    die('Credential has no signature. Cannot generate proof for authentication.')
+  }
+
+  const wallet = getFlag('--wallet', '')
+  const paymentCapable = hasFlag('--payment-capable')
+  const paymentEndpoint = getFlag('--payment-endpoint', '')
+  const moltbookProfile = getFlag('--moltbook-profile', '')
+
+  if (!wallet && !paymentCapable && !paymentEndpoint && !moltbookProfile) {
+    die('At least one update required: --wallet, --payment-capable, --payment-endpoint, --moltbook-profile')
+  }
+
+  console.log(`Updating credential for ${domain}...`)
+
+  const body: Record<string, any> = {}
+  if (wallet) { body.walletAddress = wallet; console.log(`  Adding wallet: ${wallet}`) }
+  if (paymentCapable) { body.paymentCapable = true; console.log('  Enabling payments') }
+  if (paymentEndpoint) { body.paymentEndpoint = paymentEndpoint; console.log(`  Payment endpoint: ${paymentEndpoint}`) }
+  if (moltbookProfile) { body.moltbookProfile = moltbookProfile; console.log(`  Moltbook profile: ${moltbookProfile}`) }
+
+  // Generate proof disclosing subjectDid (index 0) for authentication
+  if (cred.blind && cred.secretProverBlind && cred.holderSecret) {
+    console.log('  Generating ZK proof for authentication...')
+    const header = new Uint8Array(Buffer.from(cred.header, 'base64'))
+    const signature = new Uint8Array(Buffer.from(cred.signature, 'base64'))
+    const publicKey = new Uint8Array(Buffer.from(cred.publicKey, 'base64'))
+    const messages = (cred.messages as string[]).map((m: string) => new TextEncoder().encode(m))
+
+    const { BlindProofGen, resolvedCiphersuite } = await getBlindModules()
+    const secretProverBlind = BigInt('0x' + cred.secretProverBlind)
+    const holderSecret = new Uint8Array(Buffer.from(cred.holderSecret, 'base64'))
+
+    const proof = await BlindProofGen({
+      PK: publicKey, signature, header,
+      ph: new Uint8Array(), messages,
+      disclosed_indexes: [0],
+      committed_messages: [holderSecret],
+      disclosed_commitment_indexes: [],
+      secret_prover_blind: secretProverBlind,
+      signer_blind: 0n,
+      ciphersuite: resolvedCiphersuite,
+    })
+    body.proof = Buffer.from(proof).toString('base64')
+
+    // Generate new commitment for re-issuance
+    console.log('  Generating new commitment for re-issuance...')
+    const { Commit } = await getBlindModules()
+    const newHolderSecret = new TextEncoder().encode(`holderSecret=${randomBytes(32).toString('hex')}`)
+    const [newCommitment, newSecretProverBlind] = await Commit({
+      committed_messages: [newHolderSecret],
+      ciphersuite: resolvedCiphersuite,
+    })
+    body.commitment = Buffer.from(newCommitment).toString('base64')
+
+    const { status, data } = await apiPost(`/api/v1/services/${domain}/credential/update`, body)
+
+    if (status >= 400) {
+      die(data.error || `Server returned ${status}`)
+    }
+
+    const newCred = data.credential || data
+
+    // Save updated credential with new holder secret
+    saveCredential(domain, {
+      ...newCred,
+      secretProverBlind: newSecretProverBlind.toString(16),
+      holderSecret: Buffer.from(newHolderSecret).toString('base64'),
+    })
+
+    console.log('')
+    console.log('--- Credential Updated ---')
+    console.log('')
+    console.log(`  ID:          ${newCred.credentialId}`)
+    console.log(`  Issued:      ${newCred.issuedAt}`)
+    console.log(`  Holder-bound: ${newCred.blind ? 'yes' : 'no'}`)
+    console.log('')
+    console.log('  Updated claims:')
+    for (let i = 0; i < newCred.messages.length; i++) {
+      console.log(`    [${String(i).padStart(2)}] ${newCred.messages[i]}`)
+    }
+    console.log('')
+    console.log(`  Credential saved to: ${credPath(domain)}`)
+    console.log('  This file contains your holder secret — treat it as confidential.')
+  } else {
+    die('Only blind (holder-bound) credentials support proof-based updates.')
+  }
+}
+
+/**
  * qz-service schema
  *
  * Fetch and display the service identity schema.
@@ -468,6 +569,7 @@ with ZK selective disclosure and holder binding.
 Usage:
   qz-service register <domain>                  Request credential (get DNS challenge)
   qz-service verify <domain>                    Verify DNS and receive credential
+  qz-service update <domain>                    Update credential attestations
   qz-service status <domain>                    Display stored credential
   qz-service proof <domain> --indexes 1,2,3     Derive ZK proof for specified claims
   qz-service schema                             View service identity schema
@@ -476,7 +578,9 @@ Usage:
 Register options:
   --category <type>          Service category (required)
   --endpoint <url>           Service endpoint URL
-  --wallet <address>         Optional wallet address on Base
+
+Update options (add attestations after DNS verification):
+  --wallet <address>         Wallet address on Base (triggers KYC/Farcaster checks)
   --payment-capable          Flag: service accepts x402 payments
   --payment-endpoint <url>   Payment endpoint URL
   --moltbook-profile <url>   Moltbook social profile URL
@@ -530,6 +634,12 @@ async function main() {
       if (!domain || domain.startsWith('-')) die('domain required: qz-service proof <domain>')
       const indexes = getFlagValues('--indexes')
       await proofCommand(domain, indexes)
+      break
+    }
+    case 'update': {
+      const domain = args[1]
+      if (!domain || domain.startsWith('-')) die('domain required: qz-service update <domain>')
+      await updateCommand(domain)
       break
     }
     case 'schema': {
