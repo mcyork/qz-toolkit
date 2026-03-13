@@ -74,6 +74,10 @@ See the [examples/](examples/) directory for working integration samples.
 
 See [`llms.txt`](llms.txt) for a machine-readable overview of this toolkit — what it does, how to register, and how to generate proofs.
 
+## Known Issues
+
+**Bun + blind BBS+ imports**: `@digitalbazaar/bbs-signatures` doesn't declare an `exports` map, so Bun can't resolve internal subpaths like `@digitalbazaar/bbs-signatures/lib/bbs/blind/interface.js`. If you're integrating proof generation into your own Bun project, use `require.resolve()` to build the path — see [`llms.txt`](llms.txt) for the workaround. This does not affect Node.js.
+
 ## License
 
 MIT

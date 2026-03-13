@@ -188,6 +188,17 @@ This is the only runtime dependency. It provides the BLS12-381 pairing-based cry
 - `@digitalbazaar/bbs-signatures/lib/bbs/blind/interface.js` — BlindProofGen, BlindProofVerify, Commit
 - `@digitalbazaar/bbs-signatures/lib/bbs/ciphersuites.js` — getCiphersuite
 
+**Bun compatibility**: Bun cannot resolve these internal subpaths directly (the package lacks an `exports` map). Bare specifier imports like `import * from '@digitalbazaar/bbs-signatures/lib/bbs/blind/interface.js'` will fail with `Cannot find module`. The fix is to resolve the package root first, then build the path:
+
+```typescript
+const basePath = require.resolve('@digitalbazaar/bbs-signatures').replace(/lib\/index\.js$/, '')
+const blindIface = await import(basePath + 'lib/bbs/blind/interface.js')
+const csMod = await import(basePath + 'lib/bbs/ciphersuites.js')
+const cs = csMod.getCiphersuite('BLS12-381-SHA-256')
+```
+
+This is a Bun-specific issue. Node.js resolves the bare subpath without this workaround.
+
 ## Claim Index Reference
 
 ### Service (QueryZeroServiceIdentity) — 16 claims
